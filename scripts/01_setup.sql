@@ -1,7 +1,7 @@
 /*
   Getting Started with Task Graphs
   01_setup.sql - a demo role, then the warehouse, database, schema and the
-  four demo tables, all owned by that role.
+  three demo tables, all owned by that role.
   Run this first, top to bottom. To start over, run 05_cleanup.sql, then this.
 */
 
@@ -10,6 +10,10 @@
 -- The member tasks run on the graph's warehouse, but a task created without
 -- a WAREHOUSE is checked for the serverless privilege at CREATE time, so the
 -- role needs EXECUTE MANAGED TASK as well as EXECUTE TASK.
+-- The task error alert (02) needs EXECUTE ALERT to run, and the
+-- SNOWFLAKE.EVENTS_VIEWER application role to read task events.
+-- MODIFY LOG EVENT LEVEL lets the role turn on task event logging for its
+-- own database; owning the database is not enough.
 -- ------------------------------------------------------------
 USE ROLE ACCOUNTADMIN;
 
@@ -19,10 +23,13 @@ GRANT CREATE DATABASE ON ACCOUNT TO ROLE DEMO_TASK_GRAPHS_ROLE;
 GRANT CREATE WAREHOUSE ON ACCOUNT TO ROLE DEMO_TASK_GRAPHS_ROLE;
 GRANT EXECUTE TASK ON ACCOUNT TO ROLE DEMO_TASK_GRAPHS_ROLE;
 GRANT EXECUTE MANAGED TASK ON ACCOUNT TO ROLE DEMO_TASK_GRAPHS_ROLE;
+GRANT EXECUTE ALERT ON ACCOUNT TO ROLE DEMO_TASK_GRAPHS_ROLE;
+GRANT APPLICATION ROLE SNOWFLAKE.EVENTS_VIEWER TO ROLE DEMO_TASK_GRAPHS_ROLE;
+GRANT MODIFY LOG EVENT LEVEL ON ACCOUNT TO ROLE DEMO_TASK_GRAPHS_ROLE;
 GRANT ROLE DEMO_TASK_GRAPHS_ROLE TO ROLE SYSADMIN;
 
-SET my_user = CURRENT_USER();
-GRANT ROLE DEMO_TASK_GRAPHS_ROLE TO USER IDENTIFIER($my_user);
+SET MY_USER = CURRENT_USER();
+GRANT ROLE DEMO_TASK_GRAPHS_ROLE TO USER IDENTIFIER($MY_USER);
 
 -- ------------------------------------------------------------
 -- Everything from here on runs as the demo role
@@ -38,6 +45,9 @@ CREATE WAREHOUSE IF NOT EXISTS DEMO_TASK_GRAPHS_WH
 
 CREATE DATABASE IF NOT EXISTS DEMO_TASK_GRAPHS
   COMMENT = 'Getting Started with Task Graphs: demo database';
+
+-- Log task events (every run's status) so the task error alert can see them.
+ALTER DATABASE DEMO_TASK_GRAPHS SET LOG_EVENT_LEVEL = 'INFO';
 
 CREATE OR REPLACE SCHEMA DEMO_TASK_GRAPHS.PIPELINE
   COMMENT = 'Getting Started with Task Graphs: tables, tasks and the task graph';
@@ -56,17 +66,12 @@ CREATE OR REPLACE TABLE RAW_ORDERS (
   LOADED_AT TIMESTAMP_LTZ
 ) COMMENT = 'Synthetic order batch, reloaded by the root task on every run';
 
-CREATE OR REPLACE TABLE REGION_SUMMARY (
-  REGION      VARCHAR,
-  ORDER_COUNT NUMBER,
-  REVENUE     NUMBER(12,2)
-) COMMENT = 'Revenue by region, written by SUMMARIZE_BY_REGION';
-
-CREATE OR REPLACE TABLE PRODUCT_SUMMARY (
-  PRODUCT     VARCHAR,
-  ORDER_COUNT NUMBER,
-  REVENUE     NUMBER(12,2)
-) COMMENT = 'Revenue by product, written by SUMMARIZE_BY_PRODUCT';
+CREATE OR REPLACE TABLE ORDER_SUMMARY (
+  DIMENSION       VARCHAR,
+  DIMENSION_VALUE VARCHAR,
+  ORDER_COUNT     NUMBER,
+  REVENUE         NUMBER(12,2)
+) COMMENT = 'Revenue by region and by product; each branch writes its own DIMENSION rows';
 
 CREATE OR REPLACE TABLE PIPELINE_LOG (
   RUN_ID    VARCHAR,

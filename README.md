@@ -6,7 +6,7 @@
 
 This repository holds the SQL scripts for the [Getting Started with Task Graphs](https://www.snowflake.com/en/developers/guides/getting-started-with-task-graphs/) guide.
 
-You build one task graph object, ORDERS_PIPELINE, that loads a synthetic batch of orders, summarizes it in two parallel branches that pass return values, checks the result, and then either publishes the summaries or quarantines the batch. A finalizer records the outcome of every run. You then add a task while the graph is resumed, commit the change, and force one bad batch so the fallback branch runs.
+You build one task graph object, ORDERS_PIPELINE, that loads a synthetic batch of orders, summarizes it in two parallel branches that pass return values, then checks the batch and either publishes the summaries or fails so a fallback quarantines the batch. A finalizer records the outcome of every run. You then change the finalizer while the graph is resumed, commit the change, and force one bad batch so the fallback branch runs and a task error alert, created from the TASKS_ERROR_RATE template, fires.
 
 Everything runs in a Snowsight workspace on 100 rows of generated data. There are no external dependencies.
 
@@ -18,16 +18,17 @@ Everything runs in a Snowsight workspace on 100 rows of generated data. There ar
 - How COMMIT, EXECUTE TASK GRAPH and committed versions work
 - How to change a resumed graph, inspect the change with TASK_GRAPH_CHANGES and release it
 - How to inspect runs with TASK_HISTORY and COMPLETE_TASK_GRAPHS
+- How to watch for failed tasks with an alert from the TASKS_ERROR_RATE template
 
 ## Prerequisites
 
-- A Snowflake account and access to the ACCOUNTADMIN role for the first statements of 01_setup.sql, which create DEMO_TASK_GRAPHS_ROLE. Everything else runs as that role
+- A Snowflake account and access to the ACCOUNTADMIN role for the first statements of 01_setup.sql, which create DEMO_TASK_GRAPHS_ROLE. Everything else runs as that role. Besides the database, warehouse and task privileges, the role gets EXECUTE ALERT, MODIFY LOG EVENT LEVEL and the SNOWFLAKE.EVENTS_VIEWER application role for the alert
 
 ## Getting Started
 
 1. Navigate to **Projects > Workspaces** in Snowsight.
 2. Click **Create** (+) and select **Git repository**.
-3. Enter the repository URL: `https://github.com/Snowflake-Labs/sfguide-getting-started-with-task-graphs`
+3. Enter the repository URL: https://github.com/Snowflake-Labs/sfguide-getting-started-with-task-graphs
 4. Select an API Integration for GitHub ([create one if needed](https://docs.snowflake.com/en/user-guide/ui-snowsight/workspaces-git#label-create-a-git-workspace)).
 5. Select **Public repository**.
 
@@ -35,10 +36,10 @@ Then run the scripts in order:
 
 | File | What it does |
 |:-----|:-------------|
-| scripts/01_setup.sql | Creates the demo role, then the warehouse, database, schema and tables |
-| scripts/02_build_task_graph.sql | Creates the member tasks and the graph, commits it, runs it once |
-| scripts/03_change_while_running.sql | Resumes the graph, adds a task, previews and commits the change |
-| scripts/04_force_failure.sql | Runs one bad batch, shows the fallback and finalizer, retires a task, suspends the graph |
+| scripts/01_setup.sql | Creates the demo role, then the warehouse, database (with task event logging on), schema and tables |
+| scripts/02_build_task_graph.sql | Creates the member tasks, the graph and a suspended task error alert, commits the graph, runs it once |
+| scripts/03_change_while_running.sql | Resumes the graph, changes a task, previews and commits the change |
+| scripts/04_force_failure.sql | Runs one bad batch, shows the fallback and finalizer, runs the alert (TRIGGERED), suspends the graph |
 | scripts/05_cleanup.sql | Drops everything the guide created, including the role |
 
 To start over, run 05_cleanup.sql and then 01_setup.sql.
@@ -73,6 +74,7 @@ sfguide-getting-started-with-task-graphs/
 - [Declare Task Graph as an object](https://docs.snowflake.com/en/user-guide/task-graph-object)
 - [CREATE TASK GRAPH](https://docs.snowflake.com/en/sql-reference/sql/create-task-graph)
 - [ALTER TASK GRAPH](https://docs.snowflake.com/en/sql-reference/sql/alter-task-graph)
+- [Configure error alerts and notifications for tasks](https://docs.snowflake.com/en/user-guide/tasks-errors-integrate)
 - [Control when tasks run with advanced branching](https://docs.snowflake.com/en/user-guide/tasks-graphs#label-task-graph-advanced-branching)
 
 ## License

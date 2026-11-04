@@ -1,8 +1,8 @@
 /*
   Getting Started with Task Graphs
-  04_force_failure.sql - Act 3: run once with bad data so the quality check
-  fails, watch the fallback branch and the finalizer, then retire a task and
-  park the graph.
+  04_force_failure.sql - Act 3: run once with bad data so PUBLISH_SUMMARIES
+  fails, watch the fallback branch, the finalizer and the task error alert,
+  then park the graph.
 */
 
 USE ROLE DEMO_TASK_GRAPHS_ROLE;
@@ -21,7 +21,7 @@ CALL SYSTEM$WAIT(60);
 SHOW TASK GRAPHS LIKE 'ORDERS_PIPELINE' IN SCHEMA DEMO_TASK_GRAPHS.PIPELINE;
 SET graph_id = (SELECT "id" FROM TABLE(RESULT_SCAN(LAST_QUERY_ID())));
 
--- CHECK_QUALITY failed, the success path was skipped, the fallback ran.
+-- PUBLISH_SUMMARIES failed and the fallback ran.
 SELECT NAME, STATE, ERROR_MESSAGE
   FROM TABLE(DEMO_TASK_GRAPHS.INFORMATION_SCHEMA.TASK_HISTORY(
          GRAPH_ID => $graph_id,
@@ -32,8 +32,7 @@ QUALIFY GRAPH_RUN_GROUP_ID = FIRST_VALUE(GRAPH_RUN_GROUP_ID) OVER (ORDER BY SCHE
 -- The payoff: every run so far, side by side.
 SELECT MIN(LOGGED_AT) AS RUN_STARTED,
        MAX(IFF(TASK_NAME = 'LOAD_ORDERS', DETAIL, NULL)) AS LOADED,
-       MAX(IFF(TASK_NAME = 'CHECK_QUALITY', DETAIL, NULL)) AS QUALITY_CHECK,
-       BOOLOR_AGG(TASK_NAME = 'PUBLISH_SUMMARIES') AS PUBLISHED,
+       MAX(IFF(TASK_NAME = 'PUBLISH_SUMMARIES', DETAIL, NULL)) AS PUBLISH,
        BOOLOR_AGG(TASK_NAME = 'QUARANTINE_BATCH') AS QUARANTINED,
        MAX(IFF(TASK_NAME = 'RECORD_OUTCOME', DETAIL, NULL)) AS FINALIZER
   FROM PIPELINE_LOG
@@ -50,20 +49,21 @@ SELECT STATE, GRAPH_VERSION, FIRST_ERROR_TASK_NAME
  ORDER BY SCHEDULED_TIME DESC;
 
 -- ------------------------------------------------------------
--- Retire FLAG_TOP_REGION. A task in the committed version of a resumed graph
--- can't be dropped: sever it, commit, then drop. IF EXISTS lets the script
--- run again after FLAG_TOP_REGION is gone.
+-- The task error alert. The template ignores task events from the last
+-- 60 seconds, so wait for the failure to age past that, run the alert now
+-- instead of waiting for its schedule, then read its history.
 -- ------------------------------------------------------------
-ALTER TASK IF EXISTS DEMO_TASK_GRAPHS.PIPELINE.FLAG_TOP_REGION
-  REMOVE AFTER DEMO_TASK_GRAPHS.PIPELINE.PUBLISH_SUMMARIES;
+CALL SYSTEM$WAIT(90);
 
-SELECT ENTITY_TYPE, ENTITY_NAME, BEFORE IS NULL AS IS_NEW, AFTER IS NULL AS IS_REMOVED
-  FROM TABLE(DEMO_TASK_GRAPHS.INFORMATION_SCHEMA.TASK_GRAPH_CHANGES(
-         TASK_GRAPH_NAME => 'DEMO_TASK_GRAPHS.PIPELINE.ORDERS_PIPELINE'));
+EXECUTE ALERT DEMO_TASK_GRAPHS.PIPELINE.TASK_ERROR_RATE;
 
-ALTER TASK GRAPH DEMO_TASK_GRAPHS.PIPELINE.ORDERS_PIPELINE COMMIT;
+CALL SYSTEM$WAIT(30);
 
-DROP TASK IF EXISTS DEMO_TASK_GRAPHS.PIPELINE.FLAG_TOP_REGION;
+SELECT NAME, STATE, SQL_ERROR_MESSAGE
+  FROM TABLE(DEMO_TASK_GRAPHS.INFORMATION_SCHEMA.ALERT_HISTORY(
+         SCHEDULED_TIME_RANGE_START => DATEADD('HOUR', -1, CURRENT_TIMESTAMP()),
+         ALERT_NAME => 'TASK_ERROR_RATE'))
+ ORDER BY SCHEDULED_TIME DESC;
 
 -- ------------------------------------------------------------
 -- Park the graph: no more scheduled runs.

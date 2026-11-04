@@ -40,8 +40,8 @@ BEGIN
 END;
 $$;
 
--- Two parallel branches. Each reads the root's return value and returns
--- the number of orders it summarized.
+-- Two parallel branches. Each reads the root's return value, writes its own
+-- DIMENSION rows of ORDER_SUMMARY and returns the number of orders it summarized.
 CREATE OR REPLACE TASK DEMO_TASK_GRAPHS.PIPELINE.SUMMARIZE_BY_REGION
   COMMENT = 'Branch: revenue by region'
   AFTER DEMO_TASK_GRAPHS.PIPELINE.LOAD_ORDERS
@@ -50,9 +50,9 @@ EXECUTE IMMEDIATE $$
 BEGIN
   LET run_id VARCHAR := SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID');
   LET loaded VARCHAR := SYSTEM$GET_PREDECESSOR_RETURN_VALUE('LOAD_ORDERS');
-  DELETE FROM REGION_SUMMARY;
-  INSERT INTO REGION_SUMMARY SELECT REGION, COUNT(*), SUM(AMOUNT) FROM RAW_ORDERS GROUP BY REGION;
-  LET total VARCHAR := (SELECT SUM(ORDER_COUNT) FROM REGION_SUMMARY)::VARCHAR;
+  DELETE FROM ORDER_SUMMARY WHERE DIMENSION = 'REGION';
+  INSERT INTO ORDER_SUMMARY SELECT 'REGION', REGION, COUNT(*), SUM(AMOUNT) FROM RAW_ORDERS GROUP BY REGION;
+  LET total VARCHAR := (SELECT SUM(ORDER_COUNT) FROM ORDER_SUMMARY WHERE DIMENSION = 'REGION')::VARCHAR;
   LET detail VARCHAR := 'root loaded ' || :loaded || ', summarized ' || :total;
   INSERT INTO PIPELINE_LOG (RUN_ID, TASK_NAME, DETAIL) VALUES (:run_id, 'SUMMARIZE_BY_REGION', :detail);
   CALL SYSTEM$SET_RETURN_VALUE(:total);
@@ -67,19 +67,19 @@ EXECUTE IMMEDIATE $$
 BEGIN
   LET run_id VARCHAR := SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID');
   LET loaded VARCHAR := SYSTEM$GET_PREDECESSOR_RETURN_VALUE('LOAD_ORDERS');
-  DELETE FROM PRODUCT_SUMMARY;
-  INSERT INTO PRODUCT_SUMMARY SELECT PRODUCT, COUNT(*), SUM(AMOUNT) FROM RAW_ORDERS GROUP BY PRODUCT;
-  LET total VARCHAR := (SELECT SUM(ORDER_COUNT) FROM PRODUCT_SUMMARY)::VARCHAR;
+  DELETE FROM ORDER_SUMMARY WHERE DIMENSION = 'PRODUCT';
+  INSERT INTO ORDER_SUMMARY SELECT 'PRODUCT', PRODUCT, COUNT(*), SUM(AMOUNT) FROM RAW_ORDERS GROUP BY PRODUCT;
+  LET total VARCHAR := (SELECT SUM(ORDER_COUNT) FROM ORDER_SUMMARY WHERE DIMENSION = 'PRODUCT')::VARCHAR;
   LET detail VARCHAR := 'root loaded ' || :loaded || ', summarized ' || :total;
   INSERT INTO PIPELINE_LOG (RUN_ID, TASK_NAME, DETAIL) VALUES (:run_id, 'SUMMARIZE_BY_PRODUCT', :detail);
   CALL SYSTEM$SET_RETURN_VALUE(:total);
 END;
 $$;
 
--- Quality check: joins the two branches, compares their return values and
--- fails the task when the batch has negative amounts.
-CREATE OR REPLACE TASK DEMO_TASK_GRAPHS.PIPELINE.CHECK_QUALITY
-  COMMENT = 'Quality check: fail when any order has a negative amount'
+-- Publish: joins the two branches, checks the batch, then publishes or fails.
+-- It fails when the batch has negative amounts or the branch totals differ.
+CREATE OR REPLACE TASK DEMO_TASK_GRAPHS.PIPELINE.PUBLISH_SUMMARIES
+  COMMENT = 'Check the batch, then publish the summaries or fail'
   AFTER DEMO_TASK_GRAPHS.PIPELINE.SUMMARIZE_BY_REGION, DEMO_TASK_GRAPHS.PIPELINE.SUMMARIZE_BY_PRODUCT
 AS
 EXECUTE IMMEDIATE $$
@@ -90,26 +90,20 @@ BEGIN
   LET by_region VARCHAR := SYSTEM$GET_PREDECESSOR_RETURN_VALUE('SUMMARIZE_BY_REGION');
   LET by_product VARCHAR := SYSTEM$GET_PREDECESSOR_RETURN_VALUE('SUMMARIZE_BY_PRODUCT');
   LET bad_rows NUMBER := (SELECT COUNT(*) FROM RAW_ORDERS WHERE AMOUNT < 0);
-  LET detail VARCHAR := 'region=' || :by_region || ' product=' || :by_product || ' bad_rows=' || :bad_rows;
-  INSERT INTO PIPELINE_LOG (RUN_ID, TASK_NAME, DETAIL) VALUES (:run_id, 'CHECK_QUALITY', :detail);
-  IF (:bad_rows > 0 OR :by_region <> :by_product) THEN
+  LET passed BOOLEAN := (:bad_rows = 0 AND :by_region = :by_product);
+  LET detail VARCHAR := 'region=' || :by_region || ' product=' || :by_product || ' bad_rows=' || :bad_rows
+                        || IFF(:passed, ', published', ', not published');
+  INSERT INTO PIPELINE_LOG (RUN_ID, TASK_NAME, DETAIL) VALUES (:run_id, 'PUBLISH_SUMMARIES', :detail);
+  IF (NOT :passed) THEN
     RAISE quality_check_failed;
   END IF;
 END;
 $$;
 
--- Success path: no WHEN, so it runs only when CHECK_QUALITY succeeds.
-CREATE OR REPLACE TASK DEMO_TASK_GRAPHS.PIPELINE.PUBLISH_SUMMARIES
-  COMMENT = 'Success path: runs only when the quality check passes'
-  AFTER DEMO_TASK_GRAPHS.PIPELINE.CHECK_QUALITY
-AS
-  INSERT INTO PIPELINE_LOG (RUN_ID, TASK_NAME, DETAIL)
-    SELECT SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID'), 'PUBLISH_SUMMARIES', 'summaries published';
-
--- Fallback path: advanced branching. Runs only when CHECK_QUALITY failed.
+-- Fallback path: advanced branching. Runs only when PUBLISH_SUMMARIES failed.
 CREATE OR REPLACE TASK DEMO_TASK_GRAPHS.PIPELINE.QUARANTINE_BATCH
-  COMMENT = 'Fallback path: runs only when the quality check fails'
-  AFTER DEMO_TASK_GRAPHS.PIPELINE.CHECK_QUALITY
+  COMMENT = 'Fallback path: runs only when PUBLISH_SUMMARIES fails'
+  AFTER DEMO_TASK_GRAPHS.PIPELINE.PUBLISH_SUMMARIES
   WHEN SYSTEM$PREDECESSORS_STATE('ALL_FAILED')
 AS
   INSERT INTO PIPELINE_LOG (RUN_ID, TASK_NAME, DETAIL)
@@ -122,7 +116,7 @@ CREATE OR REPLACE TASK DEMO_TASK_GRAPHS.PIPELINE.RECORD_OUTCOME
 AS
   INSERT INTO PIPELINE_LOG (RUN_ID, TASK_NAME, DETAIL)
     SELECT SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID'), 'RECORD_OUTCOME',
-           IFF(COUNT_IF(TASK_NAME = 'PUBLISH_SUMMARIES') > 0, 'outcome=PUBLISHED', 'outcome=QUARANTINED')
+           IFF(COUNT_IF(TASK_NAME = 'QUARANTINE_BATCH') > 0, 'outcome=QUARANTINED', 'outcome=PUBLISHED')
       FROM PIPELINE_LOG
      WHERE RUN_ID = SYSTEM$TASK_RUNTIME_INFO('CURRENT_TASK_GRAPH_RUN_GROUP_ID');
 
@@ -135,13 +129,32 @@ CREATE OR REPLACE TASK GRAPH DEMO_TASK_GRAPHS.PIPELINE.ORDERS_PIPELINE
   ROOTS = (DEMO_TASK_GRAPHS.PIPELINE.LOAD_ORDERS)
   FINALIZER = DEMO_TASK_GRAPHS.PIPELINE.RECORD_OUTCOME
   CONFIG = $${"inject_bad_rows": false}$$
-  COMMENT = 'Orders pipeline: load, summarize, check, publish or quarantine'
+  COMMENT = 'Orders pipeline: load, summarize, publish or quarantine'
   TASK_DEFAULTS (WAREHOUSE = DEMO_TASK_GRAPHS_WH, LOG_LEVEL = 'INFO');
 
 -- Freeze the definition into the first committed version.
 ALTER TASK GRAPH DEMO_TASK_GRAPHS.PIPELINE.ORDERS_PIPELINE COMMIT;
 
 SHOW TASK GRAPHS IN SCHEMA DEMO_TASK_GRAPHS.PIPELINE;
+
+-- ------------------------------------------------------------
+-- A task error alert from the TASKS_ERROR_RATE template. It fires when the
+-- share of failed task runs in this database crosses the threshold, and
+-- notifies in Snowsight (IN_APP). The threshold is 2 percent so that the one
+-- failed task in 04 is enough to fire it: the template counts every task
+-- status event, skipped runs included, so the guide's three graph runs give
+-- 18 events and one failure is about 5.6 percent. It is created suspended;
+-- 04 runs it on demand with EXECUTE ALERT. Resume it to check every 60 minutes.
+-- ------------------------------------------------------------
+CREATE OR ALTER ALERT DEMO_TASK_GRAPHS.PIPELINE.TASK_ERROR_RATE
+  FROM TEMPLATE TASKS_ERROR_RATE
+  WAREHOUSE = DEMO_TASK_GRAPHS_WH
+  SCHEDULE = '60 MINUTE'
+  COMMENT = 'Fires when the task error rate in DEMO_TASK_GRAPHS crosses 2 percent'
+  TEMPLATE_PARAMS = '{"template_variables":{"ERROR_RATE_THRESHOLD":0.02,"SCOPE_ACTIVE":"DATABASE","SCOPE_DATABASE":"DEMO_TASK_GRAPHS","NOTIFICATION_MODE":"IN_APP"}}';
+
+SHOW ALERTS IN SCHEMA DEMO_TASK_GRAPHS.PIPELINE
+  ->> SELECT "name", "state", "warehouse", "schedule" FROM $1;
 
 -- ------------------------------------------------------------
 -- Run it once, now. The graph stays suspended; EXECUTE runs the
